@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/tomasz-rosiek/mrd-parser.svg?branch=master)](https://travis-ci.org/tomasz-rosiek/mrd-parser)
+
 Typesafe parser of the data encoded on machine readable passport.
 
 The format of data available on machine readable travel documents is
