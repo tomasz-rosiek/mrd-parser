@@ -4,6 +4,8 @@ import java.time.LocalDate
 
 import shapeless.HList
 
+case class ValidationError(fieldName : String, error : String)
+
 sealed trait Sex
 case object Male extends Sex
 case object Female extends Sex
@@ -12,6 +14,11 @@ sealed trait DocField {
   type Result
   def name : String
 }
+
+case class DocumentTypeField(name : String) extends DocField {
+  type Result = String
+}
+
 
 case class StrField(name : String, length : Int, checksum : Boolean = false) extends DocField {
   type Result = String

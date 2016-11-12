@@ -5,79 +5,75 @@ import java.time.format.DateTimeFormatter
 
 import shapeless._
 
+import scala.util.{Failure, Success, Try}
+
 object MRDParser {
 
   trait Decoder[F, R] {
-    def parse(input : String, f : F) : (R, String)
+    def parse(input : String, f : F) : (Either[List[ValidationError], R], String)
   }
 
-  trait FieldDecoder[F, R] extends Decoder[F, R] {
-    def parse(input : String, f : F) : (R, String) = {
-      val (value, rest) = input.splitAt(length(f))
-      (decoder(value, f), rest)
-    }
-    def length(f : F) : Int
-    def decoder(i : String, f : F) : R
+  private def fieldParser[F, R](length : F => Int)(decoder : (F, String) => Either[List[ValidationError], R]) =
+    new Decoder[F, R] {
+
+      override def parse(input : String, f : F) : (Either[List[ValidationError], R], String) = {
+        val (value, rest) = input.splitAt(length(f))
+        (decoder(f, value), rest)
+      }
   }
 
-  implicit val stringFieldDecoder = new FieldDecoder[StrField, String] {
-    override def parse(input : String, f : StrField) : (String, String) = {
-      val (value, rest) = input.splitAt(f.length)
-      (decoder(value, f), rest)
-    }
-    override def decoder(i : String, f : StrField) : String = {
+  implicit val stringFieldDecoder = fieldParser[StrField, String](f => f.length) {
+    (f : StrField, i : String) =>
       val textWithChecksum = i.replaceAll("<", " ")
-      val text = if (f.checksum) {
+      if (f.checksum) {
         val result = textWithChecksum.substring(0, textWithChecksum.length - 2)
         val checksum = textWithChecksum(textWithChecksum.length - 1)
-        if (!validateChecksum(result, checksum))
-          throw new IllegalStateException("Invalid field")
-        result
+        if (!validateChecksum(result, checksum)) {
+          Left(List(ValidationError(f.name, "Invalid checksum")))
+        } else {
+          Right(result.trim)
+        }
       } else {
-        textWithChecksum
+        Right(textWithChecksum.trim)
       }
-      text.trim
-    }
-
-    override def length(f: StrField): Int = f.length
-
   }
 
-  implicit val dateFieldDecoder = new FieldDecoder[DateField, LocalDate] {
-
-    override def decoder(i : String, f : DateField) = {
-      val dateStr = i.substring(0, 6)
-      val date = LocalDate.parse(dateStr, DateTimeFormatter.ofPattern("yyMMdd"))
-      if (!validateChecksum(dateStr, i(6)))
-        throw new IllegalStateException("Invalid date")
-      if (date.getYear > 2050) date.minusYears(100) else date
-    }
-
-    override def length(f: DateField): Int = 7
-
+  implicit val dateFieldDecoder = fieldParser[DateField, LocalDate](_ => 7) {
+    (f : DateField, i : String) =>
+    val dateStr = i.substring(0, 6)
+      Try { LocalDate.parse(dateStr, DateTimeFormatter.ofPattern("yyMMdd"))} match {
+        case Success(date) =>
+          if (!validateChecksum(dateStr, i(6))) {
+            Left(List(ValidationError(f.name, "Invalid checksum")))
+          } else {
+            Right(if (date.getYear > 2050) date.minusYears(100) else date)
+          }
+        case Failure(_) => Left(List(ValidationError(f.name, "Invalid date")))
+      }
   }
 
-  implicit val sexFieldDecoder = new FieldDecoder[SexField, Sex] {
-
-    override def decoder(i : String, f : SexField) = i match {
-      case "M" => Male
-      case "F" => Female
-    }
-
-    override def length(f: SexField): Int = 1
+  implicit val sexFieldDecoder = fieldParser[SexField, Sex](_ => 1) {
+    case (_, "M") => Right(Male)
+    case (_, "F") => Right(Female)
+    case (f, other) => Left(List(ValidationError(f.name, "Invalid value")))
   }
 
   implicit val hnilDecoder = new Decoder[HNil, HNil] {
-    override def parse(input: String, f: HNil): (HNil, String) = (HNil, input) //TODO Check for termination
+    override def parse(input: String, f: HNil) = (Right(HNil), input) //TODO Check for termination
   }
 
-  implicit def hListDecoder[H, T <: HList, RH, RT <: HList]
-  (implicit headDecoder : Decoder[H, RH], tailDecoder : Decoder[T, RT])
+  implicit def hListDecoder[H, T <: HList, RH, RT <: HList](implicit headDecoder : Decoder[H, RH], tailDecoder : Decoder[T, RT])
   = new Decoder[H :: T, RH :: RT] {
-    override def parse(input: String, f: H :: T): (RH :: RT, String) = {
-      val headResult = headDecoder.parse(input, f.head)
-      val tailResult = tailDecoder.parse(headResult._2, f.tail)
-      (headResult._1 :: tailResult._1, tailResult._2)
+    override def parse(input: String, f: H :: T): (Either[List[ValidationError], RH :: RT], String) = {
+      val (headField, headRest) = headDecoder.parse(input, f.head)
+      val (tailFields, tailRest) = tailDecoder.parse(headRest, f.tail)
+      (headField, tailFields) match {
+        case (Right(h), Right(t)) => (Right(h :: t), tailRest)
+        case (Left(h), Left(t)) => (Left(h ++ t), tailRest)
+        case (Left(h), _) => (Left(h), tailRest)
+        case (_, Left(t)) => (Left(t), tailRest)
+      }
+
     }
   }
 
@@ -99,14 +95,18 @@ object MRDParser {
     generatedChecksum == mapChar(checksum)
   }
 
-  private def decode[I <: HList, R](definition : I, input : String)(implicit decoder : Decoder[I, R]) : R =
+  private def decode[I <: HList, R](definition : I, input : String)(implicit decoder : Decoder[I, R]) :
+  Either[List[ValidationError], R] =
     decoder.parse(input.filterNot(_.isWhitespace), definition)._1
 
   implicit class GenericDecoder[R, I, N <: HList](d : DocumentDefinition.Aux[N, R])(implicit gg : Generic.Aux[R, I],
                                                                            decoder : Decoder[N, I]) {
-    def decode(input : String): R = {
+    def decode(input : String): Either[List[ValidationError], R] = {
       val generic = MRDParser.decode[N, I](d.fields, input)
-      gg.from(generic)
+      generic match {
+        case Right(v) => Right(gg.from(v))
+        case Left(v) => Left(v)
+      }
     }
 
   }
